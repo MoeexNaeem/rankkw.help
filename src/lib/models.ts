@@ -1,0 +1,156 @@
+import mongoose, { Schema, model, models, type Document } from 'mongoose'
+import { SNAPSHOT_RETENTION_DAYS } from '@/utils'
+import type {
+  IKeywordCache, IKeywordHistory, IOTP,
+  IShopSnapshot, ITrackedShop,
+  ICollectiveKeywordData, IApiUsage,
+} from '@/types'
+
+// ─── User ─────────────────────────────────────────────────────────────────────
+export interface IUserDoc extends Document {
+  name: string
+  email: string
+  password: string
+  role: 'user' | 'admin'
+  plan: 'free' | 'grow' | 'scale'
+  isVerified: boolean
+  etsyShopId?: string
+  etsyAccessToken?: string
+  etsyRefreshToken?: string
+  etsyTokenExpiry?: Date
+  savedKeywords: string[]
+  searchCount: number
+  lastSearchReset: Date
+}
+
+const UserSchema = new Schema<IUserDoc>({
+  name:             { type: String, required: true, trim: true, maxlength: 60 },
+  email:            { type: String, required: true, unique: true, lowercase: true, trim: true, index: true },
+  password:         { type: String, required: true, select: false }, // never returned by default
+  role:             { type: String, enum: ['user','admin'], default: 'user' },
+  plan:             { type: String, enum: ['free','grow','scale'], default: 'free' },
+  isVerified:       { type: Boolean, default: false },
+  etsyShopId:       { type: String },
+  etsyAccessToken:  { type: String, select: false },
+  etsyRefreshToken: { type: String, select: false },
+  etsyTokenExpiry:  { type: Date },
+  savedKeywords:    { type: [String], default: [] },
+  searchCount:      { type: Number, default: 0 },
+  lastSearchReset:  { type: Date, default: Date.now },
+}, { timestamps: true })
+
+// ─── OTP ──────────────────────────────────────────────────────────────────────
+const OTPSchema = new Schema<IOTP>({
+  email:     { type: String, required: true, lowercase: true, index: true },
+  code:      { type: String, required: true },
+  type:      { type: String, enum: ['reset','verify'], required: true },
+  expiresAt: { type: Date, required: true, index: { expireAfterSeconds: 0 } }, // MongoDB TTL auto-delete
+}, { timestamps: true })
+
+OTPSchema.index({ email: 1, type: 1 })
+
+// ─── Keyword Cache ─────────────────────────────────────────────────────────────
+const KeywordCacheSchema = new Schema<IKeywordCache>({
+  keyword:   { type: String, required: true, index: true, lowercase: true, trim: true },
+  // Country filter — Google volume/CPC/competition are geo-specific, so each
+  // country caches its own document for the same keyword. Defaults to US.
+  geo:       { type: String, default: 'US', uppercase: true, trim: true },
+  data:      { type: Schema.Types.Mixed, required: true },
+  expiresAt: { type: Date, required: true, index: { expireAfterSeconds: 0 } },
+}, { timestamps: true })
+
+KeywordCacheSchema.index({ keyword: 1, geo: 1, createdAt: -1 })
+
+// ─── Collective Keyword Data ───────────────────────────────────────────────────
+// The Collective Keyword Search tool saves each searched keyword's FULL package
+// (the same KeywordSearchResponse a single search returns) as its own document.
+// A saved package is served for 5 h after its Etsy data was fetched
+// (`lastRefreshedAt`), then re-fetched live: Etsy's API Terms allow listing
+// content to be shown at most 6 h old (lib/collective-keywords.ts).
+const CollectiveKeywordDataSchema = new Schema<ICollectiveKeywordData>({
+  keyword:         { type: String, required: true, lowercase: true, trim: true },
+  geo:             { type: String, default: 'US', uppercase: true, trim: true },
+  data:            { type: Schema.Types.Mixed, required: true },
+  searchedAt:      { type: Date, default: Date.now },
+  lastRefreshedAt: { type: Date, default: Date.now },
+}, { timestamps: true })
+
+// One package per keyword per country — makes the DB-first upsert idempotent.
+CollectiveKeywordDataSchema.index({ keyword: 1, geo: 1 }, { unique: true })
+// Deleted 6 h after its Etsy data was fetched: it is never served after 5 h, so
+// keeping it longer would only be storing Etsy content.
+CollectiveKeywordDataSchema.index({ lastRefreshedAt: 1 }, { expireAfterSeconds: 6 * 60 * 60 })
+
+// ─── API Usage (daily counters) ────────────────────────────────────────────────
+// One row per UTC day, counting how many Etsy / Google API calls were made that
+// day. Powers the admin dashboard's usage stats. Incremented via lib/usage.ts,
+// which coalesces many calls into a single $inc so the (slow) DB isn't hit per call.
+const ApiUsageSchema = new Schema<IApiUsage>({
+  day:         { type: String, required: true, unique: true },   // YYYY-MM-DD (UTC)
+  etsyCalls:   { type: Number, default: 0 },
+  googleCalls: { type: Number, default: 0 },
+}, { timestamps: true })
+
+// ─── Search History ────────────────────────────────────────────────────────────
+const KeywordHistorySchema = new Schema<IKeywordHistory>({
+  keyword:    { type: String, required: true, lowercase: true, trim: true },
+  searchedAt: { type: Date, default: Date.now },
+  userId:     { type: String, index: true },
+}, { timestamps: false })
+
+KeywordHistorySchema.index({ userId: 1, searchedAt: -1 })
+
+/**
+ * Retention for snapshot history: SNAPSHOT_RETENTION_DAYS (90 days), the longest
+ * range the sales history views offer. Etsy's API Terms say stored content must be
+ * kept no longer than reasonably necessary, so this is an enforced limit. Etsy's
+ * caching rule (6h listings / 24h other) governs re-displaying their content AS
+ * CURRENT, which we never do:
+ * every current figure is fetched live, and a snapshot is only ever rendered as a
+ * dated historical measurement. This bound keeps that distinction honest.
+ */
+const SNAPSHOT_TTL_SECONDS = SNAPSHOT_RETENTION_DAYS * 24 * 60 * 60
+
+// ─── Shop Snapshot ─────────────────────────────────────────────────────────────
+// One row per shop per UTC day. This is the ONLY source of sales history — Etsy
+// gives a lifetime total with no series and no backfill, so a day not captured
+// is a day lost forever. Not TTL'd on a short window (that would defeat the
+// point) but genuinely capped at SNAPSHOT_RETENTION_DAYS via the index below.
+const ShopSnapshotSchema = new Schema<IShopSnapshot>({
+  shopId:         { type: Number, required: true, index: true },
+  shopName:       { type: String, required: true, trim: true },
+  day:            { type: String, required: true },   // YYYY-MM-DD (UTC)
+  sales:          { type: Number, default: null },
+  favorers:       { type: Number, default: null },
+  reviewCount:    { type: Number, default: null },
+  reviewAverage:  { type: Number, default: null },
+  activeListings: { type: Number, default: null },
+  isVacation:     { type: Boolean, default: false },
+  capturedAt:     { type: Date, default: Date.now },
+}, { timestamps: false })
+
+// Unique per shop per day — makes capture idempotent, so recording opportunistically
+// on every shop read can't produce duplicate rows.
+ShopSnapshotSchema.index({ shopId: 1, day: 1 }, { unique: true })
+ShopSnapshotSchema.index({ shopId: 1, capturedAt: -1 })
+// Enforces the retention bound in the database rather than in a comment.
+ShopSnapshotSchema.index({ capturedAt: 1 }, { expireAfterSeconds: SNAPSHOT_TTL_SECONDS })
+
+// ─── Tracked Shop ──────────────────────────────────────────────────────────────
+// Shops a user has starred for guaranteed daily capture by the cron route.
+const TrackedShopSchema = new Schema<ITrackedShop>({
+  userId:   { type: String, required: true, index: true },
+  shopId:   { type: Number, required: true },
+  shopName: { type: String, required: true, trim: true },
+}, { timestamps: true })
+
+TrackedShopSchema.index({ userId: 1, shopId: 1 }, { unique: true })
+
+export const User          = models.User          ?? model<IUserDoc>('User', UserSchema)
+export const ShopSnapshot    = models.ShopSnapshot    ?? model<IShopSnapshot>('ShopSnapshot', ShopSnapshotSchema)
+export const TrackedShop     = models.TrackedShop     ?? model<ITrackedShop>('TrackedShop', TrackedShopSchema)
+export const OTP           = models.OTP           ?? model<IOTP>('OTP', OTPSchema)
+export const KeywordCache  = models.KeywordCache  ?? model<IKeywordCache>('KeywordCache', KeywordCacheSchema)
+export const KeywordHistory= models.KeywordHistory?? model<IKeywordHistory>('KeywordHistory', KeywordHistorySchema)
+export const CollectiveKeywordData = models.CollectiveKeywordData ?? model<ICollectiveKeywordData>('CollectiveKeywordData', CollectiveKeywordDataSchema)
+export const ApiUsage      = models.ApiUsage      ?? model<IApiUsage>('ApiUsage', ApiUsageSchema)

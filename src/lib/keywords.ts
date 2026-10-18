@@ -1,0 +1,153 @@
+/**
+ * Keyword pipeline, split by cost.
+ *
+ * One cold keyword needs ~33 Etsy calls, and the shared rate gate (8/sec) means
+ * that's ~13s wall-clock. Only THREE of those calls are needed to render the
+ * page — the base search, its image batch, and the taxonomy lookup. The other
+ * ~30 are enrichment: a live search per related keyword, plus the near-match
+ * variants.
+ *
+ * So the work is split into three independently-cached stages that the client
+ * requests in parallel:
+ *
+ *   core     ~1–2s   stats, listings, analysis, related keywords (competition null)
+ *   related  ~4s     the same related keywords with their real competition probed
+ *   near     ~1s     morphological variants, each measured
+ *
+ * The page paints as soon as `core` lands and fills in as the rest arrive,
+ * instead of showing a spinner for 13 seconds.
+ */
+import { connectDB } from '@/lib/db'
+import { KeywordCache } from '@/lib/models'
+import { memCache, cacheKey, CACHE_TTL } from '@/lib/cache'
+import { searchEtsyListingsPaged, buildKeywordStats, buildSearchAnalysis, warmTaxonomy } from '@/lib/etsy'
+import { googleKeywordMetrics, googleAccountCurrency, isGoogleAdsConfigured } from '@/lib/google-ads'
+import type { KeywordSearchResponse } from '@/types'
+
+// v9: core/related now carry Google competition + CPC (account currency), not just
+// volume. Bump when the CORE shape changes.
+export const KEYWORD_VERSION = 'v9'
+
+// Google volume/CPC/competition are country-specific, so the core & related keys
+// carry the geo. Near matches are pure Etsy (geo-independent), so they don't.
+export function coreKey(query: string, geo = 'US') { return cacheKey('keyword', KEYWORD_VERSION, 'core', geo, query) }
+export function relatedKey(query: string, geo = 'US') { return cacheKey('keyword', KEYWORD_VERSION, 'related', geo, query) }
+export function nearKey(query: string) { return cacheKey('keyword', KEYWORD_VERSION, 'near', query) }
+
+/**
+ * The Mongo cache is keyed on the keyword alone, not the version — so this
+ * predicate is the only thing retiring documents written under an older shape.
+ * Every field added to the core response needs a probe here.
+ */
+function isStaleCore(d?: KeywordSearchResponse): boolean {
+  if (!d) return true
+  return (
+    d.stats?.difficulty == null ||
+    d.stats?.totalResults == null ||
+    d.analysis == null ||
+    d.analysis.priceSample == null ||
+    d.analysis.ages == null ||
+    // Cached before the taxonomy was warm, so its categories are empty only
+    // because the names hadn't loaded. Without this it would serve "loading
+    // categories" forever, long after the taxonomy became available.
+    d.analysis.categoriesPending === true ||
+    // Pre-v7 docs carry the fabricated shape (avgSearches / sine-wave trends).
+    d.stats.avgViews == null ||
+    d.stats.favPerView == null ||
+    d.related.some(r => r.listingsByMonth == null || r.avgViews === undefined) ||
+    (isGoogleAdsConfigured() && d.stats?.googleSearches == null) ||
+    // Pre-v9 docs carry Google volume but not competition/CPC/currency. The Mongo
+    // cache keys on the keyword alone, so bumping KEYWORD_VERSION doesn't retire
+    // them — this probe does. A fresh configured doc always SETS googleCurrency
+    // (to the code or null), so `undefined` uniquely marks the old shape.
+    (isGoogleAdsConfigured() && d.stats?.googleCurrency === undefined)
+  )
+}
+
+/**
+ * Fast path: everything the page needs to paint. ~3 Etsy calls.
+ *
+ * `related` comes back with `competition: null` — that's honest, not lazy: a
+ * 100-listing sample genuinely cannot know how many listings compete for a tag
+ * across all of Etsy. getRelated() probes it for real.
+ */
+export async function getKeywordCore(query: string, geo = 'US', force = false): Promise<KeywordSearchResponse> {
+  const key = coreKey(query, geo)
+
+  // Kick the taxonomy fetch off in the background on every request. It's needed
+  // only for category NAMES, so it must never block the response — but starting
+  // it now means it's usually ready before anyone opens the Analysis tab.
+  warmTaxonomy()
+
+  // `force` (used by the weekly refresh cron) bypasses BOTH caches so the data is
+  // truly re-fetched live; otherwise serve mem → DB when fresh.
+  if (!force) {
+    const memHit = memCache.get<KeywordSearchResponse>(key)
+    if (memHit && !isStaleCore(memHit)) return memHit
+
+    try {
+      await connectDB()
+      const dbHit = await KeywordCache.findOne({ keyword: query, geo }).lean()
+      if (dbHit) {
+        const data = dbHit.data as KeywordSearchResponse
+        if (!isStaleCore(data)) {
+          memCache.set(key, data, CACHE_TTL.KEYWORD)
+          return data
+        }
+      }
+    } catch (e) {
+      console.error('[Keywords] DB lookup:', e)
+    }
+  }
+
+  // Google volume/CPC/competition is a SEPARATE API (not behind the Etsy rate
+  // gate), so fire it up front and let it run DURING the Etsy search + analysis
+  // rather than after. It's the slowest single call (worse under 429 retries), so
+  // overlapping it hides its latency instead of adding to it. Caught so a Google
+  // hiccup degrades to "—" instead of failing the whole keyword.
+  const googleP = isGoogleAdsConfigured()
+    ? Promise.all([googleKeywordMetrics([query], geo), googleAccountCurrency()])
+        .catch(e => { console.error('[Keywords] google:', e); return null })
+    : null
+
+  // No images on the fast path: the image batch is a second ~1.5s round-trip and
+  // only the Top Listings sub-tab renders them. /api/keywords/listings fetches
+  // them on demand when that tab is opened.
+  const { listings, count } = await searchEtsyListingsPaged(query, 100, 0, { skipImages: true })
+  const data = buildKeywordStats(query, listings, count)
+
+  // Analysis is computed from listings we already have. `false` = don't block on
+  // the 365KB taxonomy fetch just to name categories; it warms for next time.
+  data.analysis = await buildSearchAnalysis(listings, false)
+    .catch(e => { console.error('[Keywords] analysis:', e); return undefined })
+
+  if (googleP) {
+    const g = await googleP
+    if (g) {
+      const [metrics, currency] = g
+      const gm = metrics.get(query)
+      if (gm) {
+        data.stats.googleSearches         = gm.searches ?? null
+        data.stats.googleCompetition      = gm.competition as KeywordSearchResponse['stats']['googleCompetition']
+        data.stats.googleCompetitionIndex = gm.competitionIndex
+        data.stats.googleCpcLow           = gm.cpcLow
+        data.stats.googleCpcHigh          = gm.cpcHigh
+      }
+      data.stats.googleCurrency = currency
+    }
+  }
+
+  memCache.set(key, data, CACHE_TTL.KEYWORD)
+
+  // Persist without blocking the response.
+  const expiresAt = new Date(Date.now() + CACHE_TTL.KEYWORD * 1000)
+  connectDB()
+    .then(() => KeywordCache.findOneAndUpdate(
+      { keyword: query, geo },
+      { keyword: query, geo, data, expiresAt },
+      { upsert: true, new: true },
+    ))
+    .catch(e => console.error('[Keywords] DB write:', e))
+
+  return data
+}
